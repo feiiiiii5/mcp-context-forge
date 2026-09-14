@@ -923,7 +923,7 @@ class TestInternalTrustedMcpTransportBridge:
         transformed_headers = {"authorization": "Bearer exchanged-token", "x-injected": "value"}
         original_headers = {"authorization": "Bearer original-token"}
 
-        mock_run_hooks = AsyncMock(return_value=(transformed_headers, None, None))
+        mock_run_hooks = AsyncMock(return_value=(transformed_headers, None, None, None))
         monkeypatch.setattr("mcpgateway.main.run_pre_request_hooks", mock_run_hooks)
 
         error_response, auth_context = await _run_internal_mcp_authentication(
@@ -940,6 +940,55 @@ class TestInternalTrustedMcpTransportBridge:
         # Verify run_pre_request_hooks was actually invoked with original headers
         mock_run_hooks.assert_awaited_once()
         assert mock_run_hooks.call_args.kwargs["headers"] == original_headers
+
+    @pytest.mark.asyncio
+    async def test_run_internal_mcp_authentication_returns_pre_request_block(self, monkeypatch):
+        """A blocking HTTP_PRE_REQUEST plugin short-circuits the Rust ingress auth path (#6817).
+
+        The violation response must be returned verbatim and authentication must not
+        run, otherwise the client sees the auth handler's status instead of the
+        plugin's - the same bypass HttpAuthMiddleware had on the Python path.
+        """
+        # Third-Party
+        from cpex.framework import HttpHookType, PluginViolation
+
+        # First-Party
+        import mcpgateway.main as main_mod
+        from mcpgateway.plugins.violation_codes import build_violation_response
+
+        block = build_violation_response(
+            PluginViolation(
+                reason="RATE_LIMIT",
+                description="Rate limit exceeded",
+                code="RATE_LIMIT",
+                http_status_code=429,
+                http_headers={"Retry-After": "60"},
+            )
+        )
+
+        monkeypatch.setattr("mcpgateway.main.settings.email_auth_enabled", False)
+        auth_probe = AsyncMock()
+        monkeypatch.setattr("mcpgateway.main.streamable_http_auth", auth_probe)
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(side_effect=lambda ht: ht == HttpHookType.HTTP_PRE_REQUEST)
+        monkeypatch.setattr(main_mod, "get_plugin_manager", AsyncMock(return_value=mock_pm))
+        monkeypatch.setattr(
+            "mcpgateway.main.run_pre_request_hooks",
+            AsyncMock(return_value=({"authorization": "Bearer exchanged-token"}, None, None, block)),
+        )
+
+        error_response, auth_context = await _run_internal_mcp_authentication(
+            method="POST",
+            path="/mcp",
+            query_string="",
+            headers={"authorization": "Bearer original-token"},
+            client_ip="203.0.113.10",
+        )
+
+        assert error_response is block
+        assert auth_context == {}
+        auth_probe.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handle_internal_mcp_authenticate_returns_auth_context(self, monkeypatch):

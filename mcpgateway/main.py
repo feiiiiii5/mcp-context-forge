@@ -129,7 +129,8 @@ from mcpgateway.plugins import (
     start_plugin_invalidation_listener,
     stop_plugin_invalidation_listener,
 )
-from mcpgateway.plugins.violation_codes import PLUGIN_VIOLATION_CODE_MAPPING, PluginViolationCode, VALID_HTTP_STATUS_CODES
+from mcpgateway.plugins.violation_codes import build_violation_response, VALID_HTTP_STATUS_CODES
+from mcpgateway.plugins.violation_codes import validate_http_headers as _validate_http_headers
 from mcpgateway.routers.openapi_schema_router import router as openapi_schema_router
 from mcpgateway.routers.server_well_known import router as server_well_known_router
 from mcpgateway.routers.well_known import router as well_known_router
@@ -636,13 +637,18 @@ async def _run_internal_mcp_authentication(
     # before building the auth scope, so plugins can transform headers.
     plugin_manager = await get_plugin_manager()
     if plugin_manager and plugin_manager.has_hooks_for(HttpHookType.HTTP_PRE_REQUEST):
-        headers, _, _ = await run_pre_request_hooks(
+        headers, _, _, blocked_response = await run_pre_request_hooks(
             plugin_manager=plugin_manager,
             headers=headers,
             path=path,
             method=method,
             client_host=client_ip,
         )
+        if blocked_response is not None:
+            # Report the plugin's decision verbatim. Returning here also keeps it out of
+            # the ``status_code >= 400`` check below, so a JSON-RPC-compliant 200 block
+            # still short-circuits authentication.
+            return blocked_response, {}
 
     scope = _build_internal_mcp_auth_scope(
         method=method,
@@ -2487,49 +2493,6 @@ async def content_pattern_error_handler(_request: Request, exc: ContentPatternEr
     )
 
 
-# RFC 9110 §5.6.2 'token' pattern for header field names:
-#   token = 1*tchar
-#   tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
-#           / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
-#           / DIGIT / ALPHA
-_RFC9110_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-
-
-def _validate_http_headers(headers: dict[str, str]) -> Optional[dict[str, str]]:
-    """Validate headers according to RFC 9110.
-
-    Args:
-        headers: dict of headers
-
-    Returns:
-        Optional[dict[str, str]]: dictionary of valid headers
-
-    Rules enforced:
-      - Header name must match RFC 9110 'token'.
-      - No whitespace before colon (enforced by dictionary usage).
-      - Header value must not contain CTL characters (0x00–0x1F, 0x7F),
-        except SP (0x20) and HTAB (0x09) which are allowed.
-    """
-    validated: dict[str, str] = {}
-    for key, value in headers.items():
-        # Validate header name (RFC 9110 token)
-        if not _RFC9110_TOKEN_RE.match(key):
-            logger.warning(f"Invalid header name: {key}")
-            continue
-        # RFC 9110: Reject CTLs (0x00–0x1F, 0x7F). Allow SP (0x20) and HTAB (0x09).
-        valid = True
-        for ch in value:
-            code = ord(ch)
-            if (0 <= code <= 31 or code == 127) and code not in (9, 32):
-                valid = False
-                break
-        if not valid:
-            logger.warning(f"Header value contains invalid characters: {key}")
-            continue
-        validated[key] = value
-    return validated if validated else None
-
-
 @app.exception_handler(PluginViolationError)
 async def plugin_violation_exception_handler(_request: Request, exc: PluginViolationError):
     """Handle plugins violations globally.
@@ -2573,46 +2536,7 @@ async def plugin_violation_exception_handler(_request: Request, exc: PluginViola
         >>> content["error"]["data"]["plugin_error_code"]
         'PROHIBITED_CONTENT'
     """
-    policy_violation = exc.violation.model_dump() if exc.violation else {}
-    message = exc.violation.description if exc.violation else "A plugin violation occurred."
-    policy_violation["message"] = exc.message
-    status_code = exc.violation.mcp_error_code if exc.violation and exc.violation.mcp_error_code else -32602
-    violation_details: dict[str, Any] = {}
-    http_status = 200
-    if exc.violation:
-        if exc.violation.description:
-            violation_details["description"] = exc.violation.description
-        if exc.violation.details:
-            violation_details["details"] = exc.violation.details
-        if exc.violation.code:
-            violation_details["plugin_error_code"] = exc.violation.code
-        if exc.violation.plugin_name:
-            violation_details["plugin_name"] = exc.violation.plugin_name
-
-        # Use HTTP status code from violation if present (e.g., 429 for rate limiting)
-        http_status = exc.violation.http_status_code if exc.violation.http_status_code else None
-        if http_status and not VALID_HTTP_STATUS_CODES.get(http_status):
-            logger.warning(f"Invalid HTTP status code {http_status} from violation, defaulting to 200")
-            http_status = None
-        if not http_status:
-            logger.debug("Using Plugin violation code mapping for lack of http_status_code")
-            mapping: Optional[PluginViolationCode] = PLUGIN_VIOLATION_CODE_MAPPING.get(exc.violation.code) if exc.violation.code else None
-            if not mapping:
-                http_status = 200
-            else:
-                http_status = mapping.code
-
-    json_rpc_error = PydanticJSONRPCError(code=status_code, message="Plugin Violation: " + message, data=violation_details)
-
-    # Collect HTTP headers from violation if present
-    headers = exc.violation.http_headers if exc.violation and exc.violation.http_headers else None
-
-    response = ORJSONResponse(status_code=http_status, content={"error": json_rpc_error.model_dump()})
-    if headers:
-        validated_headers = _validate_http_headers(headers)
-        if validated_headers:
-            response.headers.update(validated_headers)
-    return response
+    return build_violation_response(exc.violation)
 
 
 @app.exception_handler(PluginError)

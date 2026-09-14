@@ -4292,7 +4292,7 @@ async def _cross_hook_plugin_session():
     manager = PluginManager(str(config_file))
     await manager.initialize()
     try:
-        _headers, global_context, context_table = await run_pre_request_hooks(
+        _headers, global_context, context_table, blocked = await run_pre_request_hooks(
             plugin_manager=manager,
             headers={"authorization": "Bearer test-token"},
             path="/mcp",
@@ -4301,6 +4301,8 @@ async def _cross_hook_plugin_session():
             client_port=54321,
         )
         assert global_context is not None and context_table
+        # No control plugin halted this hook set, so the request is not short-circuited.
+        assert blocked is None
 
         _perm_result, context_table = await manager.invoke_hook(
             HttpHookType.HTTP_AUTH_CHECK_PERMISSION,

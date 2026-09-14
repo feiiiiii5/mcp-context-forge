@@ -852,10 +852,11 @@ class TestRunPreRequestHooks:
         pm.has_hooks_for.return_value = False
 
         original = {"authorization": "Bearer abc", "x-custom": "val"}
-        merged, ctx, table = await run_pre_request_hooks(pm, original, "/test", "GET")
+        merged, ctx, table, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         assert merged is original
         assert table is None
+        assert blocked is None
         pm.invoke_hook.assert_not_called()
 
     @pytest.mark.asyncio
@@ -875,12 +876,13 @@ class TestRunPreRequestHooks:
         pm.invoke_hook = mock_invoke_hook
 
         original = {"x-custom": "original"}
-        merged, ctx, table = await run_pre_request_hooks(pm, original, "/path", "POST", client_host="127.0.0.1")
+        merged, ctx, table, blocked = await run_pre_request_hooks(pm, original, "/path", "POST", client_host="127.0.0.1")
 
         assert merged["x-custom"] == "original"
         assert merged["x-injected"] == "plugin-value"
         assert table == {"ctx": "data"}
         assert ctx is not None
+        assert blocked is None
 
     @pytest.mark.asyncio
     async def test_no_modification_when_plugin_returns_no_payload(self):
@@ -897,9 +899,10 @@ class TestRunPreRequestHooks:
         pm.invoke_hook = mock_invoke_hook
 
         original = {"authorization": "Bearer xyz"}
-        merged, ctx, table = await run_pre_request_hooks(pm, original, "/test", "GET")
+        merged, ctx, table, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         assert merged is original
+        assert blocked is None
 
     @pytest.mark.asyncio
     async def test_auth_header_override_stripped_by_default(self):
@@ -924,7 +927,7 @@ class TestRunPreRequestHooks:
         original = {"authorization": "Bearer original-token"}
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("mcpgateway.middleware.http_auth_middleware.settings.plugins_can_override_auth_headers", False)
-            merged, _, _ = await run_pre_request_hooks(pm, original, "/test", "GET")
+            merged, _, _, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         # Original auth header must survive; plugin's override is stripped
         assert merged["authorization"] == "Bearer original-token"
@@ -954,7 +957,7 @@ class TestRunPreRequestHooks:
         original = {"authorization": "Bearer original-token", "x-api-key": "original-key"}  # pragma: allowlist secret
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("mcpgateway.middleware.http_auth_middleware.settings.plugins_can_override_auth_headers", False)
-            merged, _, _ = await run_pre_request_hooks(pm, original, "/test", "GET")
+            merged, _, _, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         # Mixed-case auth header overrides must be stripped
         assert merged["authorization"] == "Bearer original-token"
@@ -985,7 +988,7 @@ class TestRunPreRequestHooks:
         original = {"authorization": "Bearer original"}
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("mcpgateway.middleware.http_auth_middleware.settings.plugins_can_override_auth_headers", True)
-            merged, _, _ = await run_pre_request_hooks(pm, original, "/test", "GET")
+            merged, _, _, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         assert merged["authorization"] == "Bearer EXCHANGED"
 
@@ -1004,10 +1007,12 @@ class TestRunPreRequestHooks:
         pm.invoke_hook = mock_invoke_hook
 
         original = {"x-test": "value"}
-        merged, ctx, table = await run_pre_request_hooks(pm, original, "/test", "GET")
+        merged, ctx, table, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
+        # A crashed hook fails open: the request still reaches the downstream handler.
         assert merged is original
         assert table is None
+        assert blocked is None
 
     @pytest.mark.asyncio
     async def test_headers_normalized_to_lowercase(self):
@@ -1032,7 +1037,7 @@ class TestRunPreRequestHooks:
         original = {"X-Original": "val"}
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("mcpgateway.middleware.http_auth_middleware.settings.plugins_can_override_auth_headers", False)
-            merged, _, _ = await run_pre_request_hooks(pm, original, "/test", "GET")
+            merged, _, _, blocked = await run_pre_request_hooks(pm, original, "/test", "GET")
 
         # All keys should be lowercase
         assert all(k == k.lower() for k in merged), f"Non-lowercase keys found: {list(merged.keys())}"
@@ -1054,7 +1059,7 @@ class TestRunPreRequestHooks:
 
         pm.invoke_hook = mock_invoke_hook
 
-        _, ctx, _ = await run_pre_request_hooks(pm, {}, "/test", "GET")
+        _, ctx, _, blocked = await run_pre_request_hooks(pm, {}, "/test", "GET")
         assert isinstance(ctx, GlobalContext)
         assert ctx.request_id is not None
 
@@ -1074,8 +1079,131 @@ class TestRunPreRequestHooks:
         pm.invoke_hook = mock_invoke_hook
 
         provided_ctx = GlobalContext(request_id="req-123", server_id="srv-1", tenant_id=None)
-        _, ctx, _ = await run_pre_request_hooks(pm, {}, "/test", "GET", global_context=provided_ctx)
+        _, ctx, _, blocked = await run_pre_request_hooks(pm, {}, "/test", "GET", global_context=provided_ctx)
         assert ctx is provided_ctx
+
+
+class TestPreRequestViolationEnforcement:
+    """A blocking ``http_pre_request`` result must stop the request (#6817).
+
+    Before the fix ``run_pre_request_hooks()`` returned only
+    ``(headers, global_context, context_table)`` and dropped
+    ``continue_processing`` / ``violation``, so ``HttpAuthMiddleware`` always
+    called ``call_next()`` and the plugin's status never reached the client.
+    """
+
+    @staticmethod
+    def _violation(**overrides):
+        # Third-Party
+        from cpex.framework import PluginViolation
+
+        kwargs = {
+            "reason": "RATE_LIMIT",
+            "description": "Rate limit exceeded",
+            "code": "RATE_LIMIT",
+            "http_status_code": 429,
+            "http_headers": {"Retry-After": "60"},
+        }
+        kwargs.update(overrides)
+        return PluginViolation(**kwargs)
+
+    @staticmethod
+    def _plugin_manager_returning(result):
+        pm = MagicMock()
+        pm.has_hooks_for.return_value = True
+
+        async def mock_invoke_hook(hook_type, payload, global_context, local_contexts=None, violations_as_exceptions=False, extensions=None):  # noqa: ARG001
+            return result, {}
+
+        pm.invoke_hook = mock_invoke_hook
+        return pm
+
+    @pytest.mark.asyncio
+    async def test_blocking_violation_is_surfaced_as_response(self):
+        """The 4th return value carries the response the client should receive."""
+        # First-Party
+        from mcpgateway.middleware.http_auth_middleware import run_pre_request_hooks
+
+        result = PluginResult(continue_processing=False, violation=self._violation())
+        merged, ctx, table, blocked = await run_pre_request_hooks(self._plugin_manager_returning(result), {"x-test": "v"}, "/test", "GET")
+
+        assert blocked is not None
+        assert blocked.status_code == 429
+        assert blocked.headers["retry-after"] == "60"
+        # Hook state is still returned so callers keep their existing behaviour.
+        assert merged == {"x-test": "v"}
+        assert ctx is not None
+        assert table == {}
+
+    @pytest.mark.asyncio
+    async def test_violation_without_halt_does_not_block(self):
+        """AUDIT/TRANSFORM violations are logged by cpex and the pipeline continues.
+
+        Enforcement keys off ``continue_processing`` — not off the mere presence of
+        a violation — so an auditing plugin cannot start rejecting traffic.
+        """
+        # First-Party
+        from mcpgateway.middleware.http_auth_middleware import run_pre_request_hooks
+
+        result = PluginResult(continue_processing=True, violation=self._violation())
+        _, _, _, blocked = await run_pre_request_hooks(self._plugin_manager_returning(result), {}, "/test", "GET")
+
+        assert blocked is None
+
+    @pytest.mark.asyncio
+    async def test_halt_without_violation_details_still_blocks(self):
+        """A control plugin halting with no violation is a block, as cpex also treats it."""
+        # First-Party
+        from mcpgateway.middleware.http_auth_middleware import run_pre_request_hooks
+
+        result = PluginResult(continue_processing=False)
+        _, _, _, blocked = await run_pre_request_hooks(self._plugin_manager_returning(result), {}, "/test", "GET")
+
+        assert blocked is not None
+        # No violation code to map, so the gateway-wide JSON-RPC default applies.
+        assert blocked.status_code == 200
+
+    def test_downstream_handler_is_not_called_when_plugin_blocks(self):
+        """End-to-end: the route behind the middleware never runs, and 429 reaches the client."""
+        app = FastAPI()
+        reached = []
+
+        @app.get("/test")
+        async def endpoint():
+            reached.append(True)
+            return {"ok": True}
+
+        app.add_middleware(HttpAuthMiddleware)
+        result = PluginResult(continue_processing=False, violation=self._violation())
+        pm = self._plugin_manager_returning(result)
+
+        with patch("mcpgateway.middleware.http_auth_middleware.get_plugin_manager", new_callable=AsyncMock, return_value=pm):
+            client = TestClient(app)
+            response = client.get("/test")
+
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "60"
+        assert response.json()["error"]["message"] == "Plugin Violation: Rate limit exceeded"
+        assert reached == []
+
+    def test_request_still_reaches_handler_when_plugin_allows(self):
+        """Guard against over-blocking: an allowed request is unaffected."""
+        app = FastAPI()
+
+        @app.get("/test")
+        async def endpoint():
+            return {"ok": True}
+
+        app.add_middleware(HttpAuthMiddleware)
+        result = PluginResult(continue_processing=True)
+        pm = self._plugin_manager_returning(result)
+
+        with patch("mcpgateway.middleware.http_auth_middleware.get_plugin_manager", new_callable=AsyncMock, return_value=pm):
+            client = TestClient(app)
+            response = client.get("/test")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
 
 
 class TestPluginsCanOverrideAuthHeaders:

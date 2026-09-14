@@ -18,12 +18,14 @@ from typing import Optional
 from cpex.framework import GlobalContext, HttpHeaderPayload, HttpHookType, HttpPostRequestPayload, HttpPreRequestPayload, PluginManager
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from starlette.types import ASGIApp
 
 # First-Party
 from mcpgateway.config import settings
 from mcpgateway.plugins import get_plugin_manager
 from mcpgateway.plugins.utils import build_request_extensions, record_plugin_metrics
+from mcpgateway.plugins.violation_codes import build_violation_response
 from mcpgateway.services.observability_service import current_trace_id
 from mcpgateway.utils.correlation_id import generate_correlation_id, get_correlation_id
 from mcpgateway.utils.verify_credentials import _resolve_auth_header_name
@@ -39,7 +41,7 @@ async def run_pre_request_hooks(
     client_host: Optional[str] = None,
     client_port: Optional[int] = None,
     global_context: Optional[GlobalContext] = None,
-) -> tuple[dict[str, str], Optional[GlobalContext], Optional[dict]]:
+) -> tuple[dict[str, str], Optional[GlobalContext], Optional[dict], Optional[Response]]:
     """Run HTTP_PRE_REQUEST plugin hooks and return (possibly modified) headers.
 
     This is the shared hook runner used by both HttpAuthMiddleware (Python flow)
@@ -56,12 +58,14 @@ async def run_pre_request_hooks(
         global_context: Optional pre-created global context. Created if not provided.
 
     Returns:
-        Tuple of (merged_headers, global_context, context_table).
+        Tuple of (merged_headers, global_context, context_table, blocked_response).
         merged_headers reflects any plugin modifications with the auth-header
-        override guard applied.
+        override guard applied. blocked_response is None unless a control plugin
+        halted the pipeline, in which case it is the response to send back - the
+        downstream handler must not be called for that request.
     """
     if not plugin_manager.has_hooks_for(HttpHookType.HTTP_PRE_REQUEST):
-        return headers, global_context, None
+        return headers, global_context, None, None
 
     if global_context is None:
         request_id = get_correlation_id() or generate_correlation_id()
@@ -85,8 +89,27 @@ async def run_pre_request_hooks(
         )
         record_plugin_metrics(current_trace_id.get(), pre_result.metadata)
 
+        # Honour a plugin decision to halt the pipeline. ``violations_as_exceptions``
+        # stays False: this coroutine sits inside a broad ``except`` that would swallow
+        # the raised PluginViolationError (and a raise from BaseHTTPMiddleware would
+        # bypass the app-level handler and reach the client as a 500), so the decision
+        # is carried back to the caller as a response instead.
+        #
+        # The check keys off continue_processing rather than the presence of a
+        # violation: cpex logs-and-continues for AUDIT/TRANSFORM violations, and only
+        # propagates continue_processing=False from CONCURRENT/SEQUENTIAL plugins -
+        # which the framework itself treats as a block even without violation details.
+        if not pre_result.continue_processing:
+            blocked_response = build_violation_response(pre_result.violation)
+            logger.warning(
+                "HTTP_PRE_REQUEST blocked request%s - returning %s without invoking the downstream handler",
+                f" (plugin {pre_result.violation.plugin_name}, code {pre_result.violation.code})" if pre_result.violation else "",
+                blocked_response.status_code,
+            )
+            return headers, global_context, context_table, blocked_response
+
         if not pre_result.modified_payload:
-            return headers, global_context, context_table
+            return headers, global_context, context_table, None
 
         modified_headers_dict = pre_result.modified_payload.root
 
@@ -126,11 +149,11 @@ async def run_pre_request_hooks(
         merged_headers = {k.lower(): v for k, v in headers.items()}
         merged_headers.update({k.lower(): v for k, v in modified_headers_dict.items()})
         logger.debug(f"Pre-request hook modified headers: {list(modified_headers_dict.keys())}")
-        return merged_headers, global_context, context_table
+        return merged_headers, global_context, context_table, None
 
     except Exception as e:
         logger.warning(f"HTTP_PRE_REQUEST hook failed: {e}", exc_info=True)
-        return headers, global_context, None
+        return headers, global_context, None, None
 
 
 class HttpAuthMiddleware(BaseHTTPMiddleware):
@@ -138,6 +161,7 @@ class HttpAuthMiddleware(BaseHTTPMiddleware):
 
     This middleware invokes plugin hooks for HTTP request processing:
     - HTTP_PRE_REQUEST: Before any authentication, allows header transformation
+      and can block the request outright
     - HTTP_POST_REQUEST: After request completion, allows response inspection
 
     The middleware allows plugins to:
@@ -145,6 +169,8 @@ class HttpAuthMiddleware(BaseHTTPMiddleware):
     - Add tracing/correlation headers
     - Implement custom authentication schemes
     - Audit authentication attempts
+    - Block a request before it reaches the application, by returning
+      continue_processing=False from the pre-request hook
     - Log response status and headers
     """
 
@@ -211,7 +237,7 @@ class HttpAuthMiddleware(BaseHTTPMiddleware):
 
         # PRE-REQUEST HOOK: Allow plugins to transform headers before authentication
         if has_pre:
-            merged_headers, global_context, context_table = await run_pre_request_hooks(
+            merged_headers, global_context, context_table, blocked_response = await run_pre_request_hooks(
                 plugin_manager=plugin_manager,
                 headers=dict(request.headers),
                 path=str(request.url.path),
@@ -220,6 +246,11 @@ class HttpAuthMiddleware(BaseHTTPMiddleware):
                 client_port=client_port,
                 global_context=global_context,
             )
+
+            # A control plugin halted the pipeline: answer with its decision and never
+            # reach the application, so the plugin's status is what the client sees.
+            if blocked_response is not None:
+                return blocked_response
 
             if context_table:
                 request.state.plugin_context_table = context_table

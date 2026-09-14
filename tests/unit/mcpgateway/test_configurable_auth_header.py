@@ -350,7 +350,7 @@ class TestPluginAuthHeaderProtection:
             mock_settings.plugins_can_override_auth_headers = False
             mock_settings.auth_header_name = "X-MCP-Gateway-Auth"
 
-            merged, _, _ = await run_pre_request_hooks(
+            merged, _, _, blocked = await run_pre_request_hooks(
                 plugin_manager=plugin_manager,
                 headers=original_headers,
                 path="/mcp",
@@ -362,3 +362,5 @@ class TestPluginAuthHeaderProtection:
         assert merged["x-mcp-gateway-auth"] == "Bearer CLIENT-GATEWAY-TOKEN"
         # Non-auth headers from the plugin should still be merged
         assert merged.get("x-trace-id") == "abc"
+        # The plugin allowed the request, so nothing short-circuits the middleware chain.
+        assert blocked is None
